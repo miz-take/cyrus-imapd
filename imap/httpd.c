@@ -68,6 +68,7 @@
 #include "httpd.h"
 #include "http_h2.h"
 #include "http_proxy.h"
+#include "http_ws.h"
 
 #include "acl.h"
 #include "assert.h"
@@ -297,7 +298,6 @@ struct auth_state *httpd_authstate = 0;
 int httpd_userisadmin = 0;
 int httpd_userisproxyadmin = 0;
 int httpd_userisanonymous = 1;
-static const char *httpd_clienthost = "[local]";
 const char *httpd_localip = NULL, *httpd_remoteip = NULL;
 struct protstream *httpd_out = NULL;
 struct protstream *httpd_in = NULL;
@@ -361,7 +361,8 @@ struct backend **backend_cached = NULL;
 
 /* end PROXY stuff */
 
-static int starttls(struct transaction_t *txn, void **tls , int *http2);
+static int starttls(struct transaction_t *txn,
+                    const char *clienthost, void **tls , int *http2);
 void usage(void);
 void shut_down(int code) __attribute__ ((noreturn));
 
@@ -539,7 +540,7 @@ static void httpd_reset(struct http_connection *conn)
 
     cyrus_reset_stdio();
 
-    httpd_clienthost = "[local]";
+    conn->clienthost = "[local]";
     if (httpd_logfd != -1) {
         close(httpd_logfd);
         httpd_logfd = -1;
@@ -655,6 +656,7 @@ int service_init(int argc __attribute__((unused)),
                LIBXML_DOTTED_VERSION);
 
     http2_init(&serverinfo);
+    ws_init(&serverinfo);
 
 #ifdef HAVE_SSL
     buf_printf(&serverinfo, " OpenSSL/%s", SHLIB_VERSION_NUMBER);
@@ -715,8 +717,18 @@ int service_main(int argc __attribute__((unused)),
     httpd_out = prot_new(1, 1);
     protgroup_insert(protin, httpd_in);
 
+    /* Setup HTTP connection */
+    memset(&http_conn, 0, sizeof(struct http_connection));
+    http_conn.pin = httpd_in;
+    http_conn.pout = httpd_out;
+
+    /* Create XML parser context */
+    if (!(http_conn.xml = xmlNewParserCtxt())) {
+        fatal("Unable to create XML parser", EC_TEMPFAIL);
+    }
+
     /* Find out name of client host */
-    httpd_clienthost = get_clienthost(0, &httpd_localip, &httpd_remoteip);
+    http_conn.clienthost = get_clienthost(0, &httpd_localip, &httpd_remoteip);
 
     if (httpd_localip && httpd_remoteip) {
         buf_setcstr(&saslprops.ipremoteport, httpd_remoteip);
@@ -769,7 +781,7 @@ int service_main(int argc __attribute__((unused)),
     httpd_tls_required =
         config_getswitch(IMAPOPT_TLS_REQUIRED) || !avail_auth_schemes;
 
-    proc_register(config_ident, httpd_clienthost, NULL, NULL, NULL);
+    proc_register(config_ident, http_conn.clienthost, NULL, NULL, NULL);
 
     /* Set inactivity timer */
     httpd_timeout = config_getint(IMAPOPT_HTTPTIMEOUT);
@@ -778,22 +790,12 @@ int service_main(int argc __attribute__((unused)),
     prot_settimeout(httpd_in, httpd_timeout);
     prot_setflushonread(httpd_in, httpd_out);
 
-    /* Setup HTTP connection */
-    memset(&http_conn, 0, sizeof(struct http_connection));
-    http_conn.pin = httpd_in;
-    http_conn.pout = httpd_out;
-
-    /* Create XML parser context */
-    if (!(http_conn.xml = xmlNewParserCtxt())) {
-        fatal("Unable to create XML parser", EC_TEMPFAIL);
-    }
-
     /* we were connected on https port so we should do
        TLS negotiation immediately */
     if (https == 1) {
         int r, http2 = 0;
 
-        r = starttls(NULL, &http_conn.tls_ctx, &http2);
+        r = starttls(NULL, http_conn.clienthost, &http_conn.tls_ctx, &http2);
         if (!r && http2) r = http2_start_session(&http_conn, NULL);
         if (r) shut_down(0);
     }
@@ -942,7 +944,8 @@ void fatal(const char* s, int code)
 
 
 #ifdef HAVE_SSL
-static int starttls(struct transaction_t *txn, void **tls, int *http2)
+static int starttls(struct transaction_t *txn,
+                    const char *clienthost, void **tls, int *http2)
 {
     int https = (txn == NULL);
     int result;
@@ -981,7 +984,7 @@ static int starttls(struct transaction_t *txn, void **tls, int *http2)
 
     /* if error */
     if (result == -1) {
-        syslog(LOG_NOTICE, "starttls failed: %s", httpd_clienthost);
+        syslog(LOG_NOTICE, "starttls failed: %s", clienthost);
 
         if (txn) txn->error.desc = "Error negotiating TLS";
         return HTTP_BAD_REQUEST;
@@ -1010,6 +1013,7 @@ static int starttls(struct transaction_t *txn, void **tls, int *http2)
 }
 #else
 static int starttls(struct transaction_t *txn __attribute__((unused)),
+                    const char *clienthost __attribute__((unused)),
                     void **tls __attribute__((unused)),
                     int *http2 __attribute__((unused)))
 {
@@ -1253,7 +1257,8 @@ EXPORTED int examine_request(struct transaction_t *txn)
 
         if (txn->flags.upgrade & UPGRADE_TLS) {
             int http2 = 0;
-            if ((ret = starttls(txn, &txn->conn->tls_ctx, &http2))) {
+            if ((ret = starttls(txn, txn->conn->clienthost,
+                                &txn->conn->tls_ctx, &http2))) {
                 txn->flags.conn = CONN_CLOSE;
                 return ret;
             }
@@ -1269,6 +1274,9 @@ EXPORTED int examine_request(struct transaction_t *txn)
                 return ret;
             }
         }
+        else if (txn->flags.upgrade & UPGRADE_WS) {
+            return ws_start_channel(txn);
+        }
 
         txn->flags.conn &= ~CONN_UPGRADE;
         txn->flags.upgrade = 0;
@@ -1280,6 +1288,7 @@ EXPORTED int examine_request(struct transaction_t *txn)
             txn->flags.upgrade |= UPGRADE_TLS;
         }
         if (http2_enabled()) txn->flags.upgrade |= UPGRADE_HTTP2;
+        if (ws_enabled()) txn->flags.upgrade |= UPGRADE_WS;
 
         if (txn->flags.upgrade) txn->flags.conn |= CONN_UPGRADE;
     }
@@ -1423,7 +1432,7 @@ EXPORTED int examine_request(struct transaction_t *txn)
     buf_printf(&txn->buf, "%s%s", config_ident,
                namespace->well_known ? strrchr(namespace->well_known, '/') :
                namespace->prefix);
-    proc_register(buf_cstring(&txn->buf), httpd_clienthost, httpd_userid,
+    proc_register(buf_cstring(&txn->buf), txn->conn->clienthost, httpd_userid,
                   txn->req_line.uri, txn->req_line.meth);
     buf_reset(&txn->buf);
 
@@ -1650,6 +1659,7 @@ EXPORTED void transaction_free(struct transaction_t *txn)
 {
     transaction_reset(txn);
 
+    ws_end_channel(txn->ws_ctx);
     http2_end_stream(txn->http2_strm);
 
     zlib_done(txn->zstrm);
@@ -1697,6 +1707,10 @@ static void cmdloop(struct http_connection *conn)
                 /* HTTP/2 output */
                 http2_output(&txn);
             }
+            else if (txn.ws_ctx) {
+                /* WebSocket output */
+                ws_output(&txn);
+            }
             prot_flush(httpd_out);
             if (backend_current) prot_flush(backend_current->out);
 
@@ -1723,6 +1737,10 @@ static void cmdloop(struct http_connection *conn)
         if (txn.conn->http2_ctx) {
             /* HTTP/2 input */
             http2_input(&txn);
+        }
+        else if (txn.ws_ctx) {
+            /* WebSocket input */
+            ws_input(&txn);
         }
         else if (http2_preface(&txn)) {
             /* HTTP/2 client connection preface */
@@ -1904,6 +1922,13 @@ static int parse_connection(struct transaction_t *txn)
                             /* Upgrade to HTTP/2 */
                             txn->flags.conn |= CONN_UPGRADE;
                             txn->flags.upgrade |= UPGRADE_HTTP2;
+                        }
+                        else if (ws_enabled() &&
+                                 !strncmp(upgrade[0], WS_TOKEN,
+                                          strcspn(upgrade[0], " ,"))) {
+                            /* Upgrade to WebSockets */
+                            txn->flags.conn |= CONN_UPGRADE;
+                            txn->flags.upgrade |= UPGRADE_WS;
                         }
                         else {
                             /* Unknown/unsupported protocol - no upgrade */
@@ -2228,7 +2253,7 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
     struct resp_body_t *resp_body = &txn->resp_body;
     static struct buf log = BUF_INITIALIZER;
     const char *upgrd_tokens[] =
-        { TLS_VERSION, NGHTTP2_CLEARTEXT_PROTO_VERSION_ID, NULL };
+        { TLS_VERSION, NGHTTP2_CLEARTEXT_PROTO_VERSION_ID, WS_TOKEN, NULL };
     const char *te[] = { "deflate", "gzip", "chunked", NULL };
     const char *ce[] = { "deflate", "gzip", "br", NULL };
 
@@ -2264,6 +2289,19 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
             if (txn->flags.upgrade) {
                 /* Construct Upgrade header */
                 comma_list_hdr(txn, "Upgrade", upgrd_tokens, txn->flags.upgrade);
+
+                if (txn->ws_ctx) {
+                    /* Add WebSocket headers */
+                    simple_hdr(txn, "Sec-WebSocket-Accept",
+                               buf_cstring(&txn->buf));
+
+                    if (txn->flags.ws_ext) {
+                        const char *ws_ext[] = { "permessage-deflate", NULL };
+ 
+                        comma_list_hdr(txn, "Sec-WebSocket-Extensions",
+                                       ws_ext, txn->flags.ws_ext);
+                    }
+                }
             }
             if (txn->flags.conn & CONN_KEEPALIVE) {
                 simple_hdr(txn, "Keep-Alive", "timeout=%d", httpd_timeout);
@@ -2576,7 +2614,7 @@ EXPORTED void response_header(long code, struct transaction_t *txn)
     buf_reset(&log);
 
     /* Add client data */
-    buf_printf(&log, "%s", httpd_clienthost);
+    buf_printf(&log, "%s", txn->conn->clienthost);
     if (httpd_userid) buf_printf(&log, " as \"%s\"", httpd_userid);
     if (txn->req_hdrs &&
         (hdr = spool_getheader(txn->req_hdrs, "User-Agent"))) {
@@ -3303,7 +3341,7 @@ static int proxy_authz(const char **authzid, struct transaction_t *txn)
     if (!(config_mupdate_server && config_getstring(IMAPOPT_PROXYSERVERS))) {
         /* Not a backend in a Murder - proxy authz is not allowed */
         syslog(LOG_NOTICE, "badlogin: %s %s %s %s",
-               httpd_clienthost, txn->auth_chal.scheme->name, httpd_authid,
+               txn->conn->clienthost, txn->auth_chal.scheme->name, httpd_authid,
                "proxy authz attempted on non-Murder backend");
         return SASL_NOAUTHZ;
     }
@@ -3315,7 +3353,7 @@ static int proxy_authz(const char **authzid, struct transaction_t *txn)
                                authzbuf, sizeof(authzbuf), &authzlen);
     if (status) {
         syslog(LOG_NOTICE, "badlogin: %s %s %s invalid user",
-               httpd_clienthost, txn->auth_chal.scheme->name,
+               txn->conn->clienthost, txn->auth_chal.scheme->name,
                beautify_string(*authzid));
         return status;
     }
@@ -3328,7 +3366,7 @@ static int proxy_authz(const char **authzid, struct transaction_t *txn)
 
     if (status) {
         syslog(LOG_NOTICE, "badlogin: %s %s %s %s",
-               httpd_clienthost, txn->auth_chal.scheme->name, httpd_authid,
+               txn->conn->clienthost, txn->auth_chal.scheme->name, httpd_authid,
                sasl_errdetail(httpd_saslconn));
         return status;
     }
@@ -3367,7 +3405,7 @@ static int auth_success(struct transaction_t *txn, const char *userid)
     httpd_userisanonymous = is_userid_anonymous(httpd_userid);
 
     syslog(LOG_NOTICE, "login: %s %s %s%s %s SESSIONID=<%s>",
-           httpd_clienthost, httpd_userid, scheme->name,
+           txn->conn->clienthost, httpd_userid, scheme->name,
            txn->conn->tls_ctx ? "+TLS" : "", "User logged in",
            session_id());
 
@@ -3601,7 +3639,8 @@ static int http_auth(const char *creds, struct transaction_t *txn)
 
         if (status) {
             syslog(LOG_NOTICE, "badlogin: %s Basic %s %s",
-                   httpd_clienthost, realuser, sasl_errdetail(httpd_saslconn));
+                   txn->conn->clienthost, realuser,
+                   sasl_errdetail(httpd_saslconn));
             free(realuser);
 
             /* Don't allow user probing */
